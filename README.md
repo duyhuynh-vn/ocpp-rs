@@ -27,3 +27,23 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
 - End-user apps, billing, pricing, vouchers, e-invoicing  
 - OCPI roaming (separate project)  
 - Vendor-specific charger drivers/diagnostics beyond standard OCPP  
+
+---
+
+## Milestones
+
+- [ ] **M0**: Bootstrap & CI
+- [ ] **M1**: Framing & envelopes (1.6J)
+- [ ] **M2**: CSMS minimal
+- [ ] **M3**: Transactions (Authorize, StartTransaction, StopTransaction)
+- [ ] **M4**: CP simulator (scenarios, jitter, reconnect storm)
+- [ ] **M5**: Commands & control (RemoteStartTransaction, Reset)
+- [ ] **M6**: Hardening (drain, rate limits, security)
+- [ ] **M7**: OCPP 2.0.1 (initial)
+- [ ] **M8**: Conformance & docs
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
