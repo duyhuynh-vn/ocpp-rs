@@ -1,0 +1,50 @@
+[package]
+name = "ocpp-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Transport layer implementation for OCPP protocol over WebSocket"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ocpp-types = { path = "../ocpp-types" }
+ocpp-messages = { path = "../ocpp-messages" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+hyper = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+pin-project = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+async-trait = "0.1"
+url = "2.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+wiremock = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default = ["client", "server"]
+client = []
+server = []
+tls = []
+compression = []

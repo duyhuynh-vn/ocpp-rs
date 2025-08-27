@@ -1,0 +1,234 @@
+# Default configuration for OCPP-RS
+# This file contains the default configuration values for all components
+
+[server]
+# Server binding configuration
+bind_address = "0.0.0.0"
+port = 8080
+# HTTP API port for REST endpoints
+http_api_port = 3000
+# Metrics and health check port
+metrics_port = 9090
+# Maximum number of concurrent WebSocket connections
+max_connections = 1000
+# Connection timeout in seconds
+connection_timeout = 30
+# Keep-alive interval in seconds
+keep_alive_interval = 60
+# Enable TLS/SSL
+tls_enabled = false
+# TLS certificate path (if TLS enabled)
+tls_cert_path = "./config/ssl/cert.pem"
+# TLS private key path (if TLS enabled)
+tls_key_path = "./config/ssl/key.pem"
+
+[database]
+# Database connection URL
+# Format: postgres://username:password@host:port/database
+url = "postgres://ocpp_user:ocpp_password@localhost:5432/ocpp_dev"
+# Maximum number of database connections in the pool
+max_connections = 16
+# Minimum number of database connections in the pool
+min_connections = 1
+# Connection timeout in seconds
+connect_timeout = 30
+# Query timeout in seconds
+query_timeout = 60
+# Enable automatic migrations
+auto_migrate = true
+# Enable SQL query logging (debug only)
+log_statements = false
+
+[redis]
+# Redis connection URL for caching and sessions
+url = "redis://localhost:6379"
+# Connection pool size
+pool_size = 10
+# Connection timeout in seconds
+timeout = 5
+# Key expiration time in seconds
+default_expiry = 3600
+
+[ocpp]
+# OCPP protocol version
+version = "1.6J"
+# Supported sub-protocols
+supported_protocols = ["ocpp1.6"]
+# Message timeout in seconds
+message_timeout = 30
+# Heartbeat interval in seconds (server-side default)
+heartbeat_interval = 60
+# Maximum message size in bytes
+max_message_size = 65536
+# Enable message validation
+validate_messages = true
+# Enable strict schema validation
+strict_validation = true
+
+[ocpp.features]
+# Core profile features
+core = true
+# Firmware management features
+firmware_management = true
+# Local auth list management
+local_auth_list_management = true
+# Reservation features
+reservation = true
+# Smart charging features
+smart_charging = true
+# Remote trigger features
+remote_trigger = true
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log format: json, pretty, compact
+format = "pretty"
+# Enable file logging
+file_enabled = true
+# Log file path
+file_path = "./logs/ocpp.log"
+# Maximum log file size in MB
+max_file_size = 100
+# Number of log files to keep
+max_files = 10
+# Enable console logging
+console_enabled = true
+# Enable structured logging
+structured = false
+# Enable tracing
+tracing_enabled = true
+
+[metrics]
+# Enable Prometheus metrics
+enabled = true
+# Metrics namespace
+namespace = "ocpp"
+# Metrics collection interval in seconds
+collection_interval = 15
+# Enable detailed request metrics
+detailed_metrics = true
+# Histogram buckets for latency metrics
+latency_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+[tracing]
+# Enable distributed tracing
+enabled = false
+# Jaeger endpoint
+jaeger_endpoint = "http://localhost:14268/api/traces"
+# Service name for tracing
+service_name = "ocpp-rs"
+# Sampling rate (0.0 to 1.0)
+sampling_rate = 0.1
+
+[security]
+# Enable authentication
+auth_enabled = true
+# JWT secret key (generate a secure random key for production)
+jwt_secret = "your-super-secret-jwt-key-change-this-in-production"
+# JWT expiration time in seconds
+jwt_expiry = 86400
+# Enable API key authentication
+api_key_enabled = false
+# Rate limiting
+rate_limiting_enabled = true
+# Requests per minute per IP
+rate_limit_rpm = 1000
+# Enable CORS
+cors_enabled = true
+# Allowed origins for CORS
+cors_origins = ["*"]
+
+[charge_point]
+# Default charge point configuration
+default_heartbeat_interval = 60
+# Default meter values interval in seconds
+default_meter_values_interval = 300
+# Default number of connectors
+default_connector_count = 2
+# Supported features
+supported_features = [
+    "Core",
+    "FirmwareManagement",
+    "LocalAuthListManagement",
+    "Reservation",
+    "SmartCharging",
+    "RemoteTrigger"
+]
+
+[simulator]
+# Charge point simulator configuration
+enabled = false
+# Number of simulated charge points
+charge_point_count = 1
+# Base charge point ID prefix
+charge_point_id_prefix = "CP"
+# Simulation speed multiplier
+simulation_speed = 1.0
+# Auto-start transactions
+auto_start_transaction = false
+# Transaction duration in seconds
+transaction_duration = 3600
+# Connector count per charge point
+connectors_per_cp = 2
+# Randomize behavior
+randomize_behavior = true
+# Reconnection settings
+max_reconnect_attempts = 10
+reconnect_interval = 30
+
+[performance]
+# Performance tuning settings
+# Worker thread count (0 = auto-detect)
+worker_threads = 0
+# Enable blocking thread pool
+blocking_threads = 512
+# Message buffer size
+message_buffer_size = 1000
+# Connection buffer size per client
+connection_buffer_size = 1024
+# Enable TCP_NODELAY
+tcp_nodelay = true
+# Keep-alive settings
+tcp_keepalive = true
+tcp_keepalive_time = 600
+tcp_keepalive_interval = 60
+tcp_keepalive_retries = 3
+
+[development]
+# Development-only settings
+# Enable debug endpoints
+debug_endpoints = false
+# Enable request/response logging
+log_requests = false
+# Enable CORS for all origins in development
+permissive_cors = false
+# Auto-reload configuration
+auto_reload_config = false
+# Enable GraphQL playground
+graphql_playground = false
+
+[conformance]
+# Conformance test configuration
+# Test suite timeout in seconds
+test_timeout = 300
+# Enable all conformance tests
+enable_all_tests = true
+# Test report output directory
+report_output_dir = "./reports"
+# Test data directory
+test_data_dir = "./test-data"
+# Enable verbose test output
+verbose_output = true
+
+[monitoring]
+# Health check configuration
+health_check_enabled = true
+health_check_interval = 30
+# Readiness probe configuration
+readiness_enabled = true
+# Liveness probe configuration
+liveness_enabled = true
+# Enable graceful shutdown
+graceful_shutdown = true
+graceful_shutdown_timeout = 30

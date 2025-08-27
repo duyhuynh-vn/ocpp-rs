@@ -1,0 +1,34 @@
+[package]
+name = "ocpp-messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OCPP message definitions and serialization for all protocol versions"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ocpp-types = { path = "../ocpp-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_test = "1.0"
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["ocpp16j"]
+ocpp16j = ["ocpp-types/ocpp16j"]
+ocpp201 = ["ocpp-types/ocpp201"]
+all-versions = ["ocpp16j", "ocpp201"]
