@@ -9,6 +9,7 @@ pub mod error;
 pub mod server;
 pub mod websocket;
 
+pub use client::WebSocketClient;
 pub use error::*;
 
 use ocpp_messages::Message;
