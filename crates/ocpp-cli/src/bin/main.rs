@@ -11,6 +11,8 @@ use futures_util::{SinkExt, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -144,14 +146,89 @@ struct SimulatorState {
     connected: bool,
     start_time: chrono::DateTime<chrono::Utc>,
     message_count: u64,
+    connector_states: HashMap<u32, ConnectorStatus>,
+    websocket_tx: Option<tokio::sync::mpsc::Sender<Message>>,
+    recent_activities: Vec<ActivityLog>,
 }
 
 #[derive(Debug, Clone)]
 struct ConnectorStatus {
     id: u32,
-    status: String,
+    status: ConnectorState,
     error_code: String,
     transaction_id: Option<u32>,
+    cable_plugged: bool,
+    current_power: f64,
+    energy_delivered: f64,
+    id_tag: Option<String>,
+    last_status_time: chrono::DateTime<chrono::Utc>,
+    remote_started: bool,
+    battery_soc: Option<f64>, // State of Charge percentage (0-100)
+}
+
+#[derive(Debug, Clone)]
+struct ActivityLog {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    activity_type: ActivityType,
+    connector_id: Option<u32>,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+enum ActivityType {
+    RemoteStart,
+    RemoteStop,
+    ManualStart,
+    ManualStop,
+    StatusChange,
+    Connection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectorState {
+    Available,
+    Preparing,
+    Charging,
+    SuspendedEV,
+    SuspendedEVSE,
+    Finishing,
+    Reserved,
+    Unavailable,
+    Faulted,
+}
+
+impl std::fmt::Display for ConnectorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectorState::Available => write!(f, "Available"),
+            ConnectorState::Preparing => write!(f, "Preparing"),
+            ConnectorState::Charging => write!(f, "Charging"),
+            ConnectorState::SuspendedEV => write!(f, "SuspendedEV"),
+            ConnectorState::SuspendedEVSE => write!(f, "SuspendedEVSE"),
+            ConnectorState::Finishing => write!(f, "Finishing"),
+            ConnectorState::Reserved => write!(f, "Reserved"),
+            ConnectorState::Unavailable => write!(f, "Unavailable"),
+            ConnectorState::Faulted => write!(f, "Faulted"),
+        }
+    }
+}
+
+impl ConnectorStatus {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            status: ConnectorState::Available,
+            error_code: "NoError".to_string(),
+            transaction_id: None,
+            cable_plugged: false,
+            current_power: 0.0,
+            energy_delivered: 0.0,
+            id_tag: None,
+            last_status_time: chrono::Utc::now(),
+            remote_started: false,
+            battery_soc: None,
+        }
+    }
 }
 
 #[tokio::main]
@@ -187,17 +264,105 @@ async fn connect_command(args: ConnectArgs) -> Result<()> {
     );
     println!();
 
-    // Create simulator state
+    // Create simulator state with initialized connectors
+    let mut connector_states = HashMap::new();
+    for i in 1..=args.connectors {
+        connector_states.insert(i, ConnectorStatus::new(i));
+    }
+
     let state = SimulatorState {
         charge_point_id: args.id.clone(),
         connectors: args.connectors,
         connected: false,
         start_time: chrono::Utc::now(),
         message_count: 0,
+        connector_states,
+        websocket_tx: None,
+        recent_activities: Vec::new(),
     };
 
     // Start WebSocket connection
     let simulator = Arc::new(tokio::sync::Mutex::new(state));
+
+    // Start energy simulation and meter values task for active transactions
+    let simulator_energy = simulator.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10)); // 10 second intervals for MeterValues
+        loop {
+            interval.tick().await;
+            let mut state = simulator_energy.lock().await;
+            let tx_option = state.websocket_tx.clone();
+
+            for (connector_id, connector) in state.connector_states.iter_mut() {
+                if connector.transaction_id.is_some() && connector.current_power > 0.0 {
+                    // Simulate energy delivery: 10 seconds * power in kW / 3600 seconds per hour
+                    let energy_increment = connector.current_power * 10.0 / 3600.0;
+                    connector.energy_delivered += energy_increment;
+
+                    // Update SoC during charging (simulate battery charging)
+                    if let Some(ref mut soc) = connector.battery_soc {
+                        // Assume 75kWh battery capacity and 90% charging efficiency
+                        let battery_capacity_kwh = 75.0;
+                        let charging_efficiency = 0.9;
+                        let soc_increment =
+                            (energy_increment * charging_efficiency / battery_capacity_kwh) * 100.0;
+                        *soc = (*soc + soc_increment).min(100.0);
+                    }
+
+                    // Send MeterValues message
+                    if let (Some(tx_id), Some(tx)) = (connector.transaction_id, &tx_option) {
+                        let mut sampled_values = vec![
+                            serde_json::json!({
+                                "value": format!("{}", (connector.energy_delivered * 1000.0) as i32),
+                                "context": "Sample.Periodic",
+                                "format": "Raw",
+                                "measurand": "Energy.Active.Import.Register",
+                                "unit": "Wh"
+                            }),
+                            serde_json::json!({
+                                "value": format!("{:.1}", connector.current_power * 1000.0),
+                                "context": "Sample.Periodic",
+                                "format": "Raw",
+                                "measurand": "Power.Active.Import",
+                                "unit": "W"
+                            }),
+                        ];
+
+                        // Add SoC if available
+                        if let Some(soc) = connector.battery_soc {
+                            sampled_values.push(serde_json::json!({
+                                "value": format!("{:.1}", soc),
+                                "context": "Sample.Periodic",
+                                "format": "Raw",
+                                "measurand": "SoC",
+                                "unit": "Percent"
+                            }));
+                        }
+
+                        let meter_values = serde_json::json!([
+                            2,
+                            format!("{}", chrono::Utc::now().timestamp()),
+                            "MeterValues",
+                            {
+                                "connectorId": connector_id,
+                                "transactionId": tx_id,
+                                "meterValue": [{
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "sampledValue": sampled_values
+                                }]
+                            }
+                        ]);
+
+                        let _ = tx.send(Message::Text(meter_values.to_string())).await;
+                        debug!(
+                            "📊 Sent MeterValues for connector {} transaction {}",
+                            connector_id, tx_id
+                        );
+                    }
+                }
+            }
+        }
+    });
 
     // Setup progress bar
     let pb = ProgressBar::new_spinner();
@@ -337,10 +502,27 @@ async fn connect_websocket(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Update simulator state
+    // Create message channel for sending messages
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(100);
+
+    // Update simulator state with websocket sender
     {
         let mut state = simulator.lock().await;
         state.connected = true;
+        state.websocket_tx = Some(tx);
+
+        // Log connection activity
+        state.recent_activities.push(ActivityLog {
+            timestamp: chrono::Utc::now(),
+            activity_type: ActivityType::Connection,
+            connector_id: None,
+            message: format!("🔗 Connected to Central System at {}", url),
+        });
+
+        // Keep only last 20 activities
+        if state.recent_activities.len() > 20 {
+            state.recent_activities.remove(0);
+        }
     }
 
     // Send BootNotification
@@ -350,22 +532,44 @@ async fn connect_websocket(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send BootNotification: {}", e))?;
 
-    // Start message handling task
+    // Start message sending task
     let simulator_clone = simulator.clone();
+    tokio::spawn(async move {
+        info!("📡 WebSocket message sender task started");
+        while let Some(msg) = rx.recv().await {
+            debug!("📤 Sending WebSocket message: {:?}", msg);
+            if let Err(e) = write.send(msg).await {
+                error!("❌ Failed to send WebSocket message: {}", e);
+                break;
+            } else {
+                debug!("✅ WebSocket message sent successfully");
+            }
+        }
+        warn!("📡 WebSocket message sender task ended");
+    });
+
+    // Start message handling task
+    let simulator_clone2 = simulator.clone();
     tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
                     debug!("Received message: {}", text);
-                    match handle_message(&text, simulator_clone.clone()).await {
+                    match handle_message(&text, simulator_clone2.clone()).await {
                         Ok(Some(response)) => {
-                            // Send response back
-                            if let Err(e) = write.send(Message::Text(response)).await {
-                                error!("Failed to send response: {}", e);
+                            info!("📤 Sending response: {}", response);
+                            // Send response back through the channel
+                            if let Some(tx) = &simulator_clone2.lock().await.websocket_tx {
+                                match tx.send(Message::Text(response.clone())).await {
+                                    Ok(_) => info!("✅ Response sent successfully"),
+                                    Err(e) => error!("❌ Failed to send response: {}", e),
+                                }
+                            } else {
+                                error!("❌ No websocket tx channel available");
                             }
                         }
                         Ok(None) => {
-                            // No response needed
+                            debug!("No response needed for message");
                         }
                         Err(e) => {
                             error!("Error handling message: {}", e);
@@ -413,6 +617,7 @@ async fn handle_message(
                     let payload = &array[3];
 
                     info!("Received CALL: {} ({})", action, message_id);
+                    debug!("📋 Payload: {}", payload);
 
                     // Handle specific actions that require responses
                     match action {
@@ -423,10 +628,26 @@ async fn handle_message(
                             return handle_change_availability_call(message_id, payload).await;
                         }
                         "RemoteStartTransaction" => {
-                            return handle_remote_start_transaction_call(message_id, payload).await;
+                            info!("🔧 Handling RemoteStartTransaction");
+                            let result = handle_remote_start_transaction_call(
+                                message_id,
+                                payload,
+                                simulator.clone(),
+                            )
+                            .await;
+                            info!("🔧 RemoteStartTransaction handler result: {:?}", result);
+                            return result;
                         }
                         "RemoteStopTransaction" => {
-                            return handle_remote_stop_transaction_call(message_id, payload).await;
+                            info!("🔧 Handling RemoteStopTransaction");
+                            let result = handle_remote_stop_transaction_call(
+                                message_id,
+                                payload,
+                                simulator.clone(),
+                            )
+                            .await;
+                            info!("🔧 RemoteStopTransaction handler result: {:?}", result);
+                            return result;
                         }
                         "Reset" => {
                             return handle_reset_call(message_id, payload).await;
@@ -467,9 +688,14 @@ async fn handle_message(
                     warn!("Unknown message type: {}", message_type);
                 }
             }
+        } else {
+            warn!("Message array too short: {} elements", array.len());
         }
+    } else {
+        warn!("Message is not a JSON array");
     }
 
+    debug!("🔚 handle_message returning None");
     Ok(None)
 }
 
@@ -545,29 +771,237 @@ async fn handle_change_availability_call(
 
 async fn handle_remote_start_transaction_call(
     message_id: &str,
-    _payload: &Value,
+    payload: &Value,
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
 ) -> Result<Option<String>> {
+    let connector_id = payload["connectorId"].as_u64().unwrap_or(1) as u32;
+    let id_tag = payload["idTag"]
+        .as_str()
+        .unwrap_or("REMOTE_TAG")
+        .to_string();
+
+    info!(
+        "📞 Remote Start Transaction request: connector={}, idTag={}, messageId={}",
+        connector_id, id_tag, message_id
+    );
+
+    // Check if connector is available for remote start
+    let can_start = {
+        let state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get(&connector_id) {
+            // Can start if connector is Available or Preparing (cable plugged)
+            match connector.status {
+                ConnectorState::Available | ConnectorState::Preparing => {
+                    connector.transaction_id.is_none()
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    };
+
+    let status = if can_start {
+        // Auto-plug cable if not already connected
+        {
+            let mut state = simulator.lock().await;
+            if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+                if !connector.cable_plugged {
+                    connector.cable_plugged = true;
+                    connector.status = ConnectorState::Preparing;
+                    info!(
+                        "🔌 Auto-plugged cable for remote start on connector {}",
+                        connector_id
+                    );
+                }
+            }
+        }
+
+        // Start the transaction
+        let transaction_id = chrono::Utc::now().timestamp() as u32;
+
+        {
+            let mut state = simulator.lock().await;
+            if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+                connector.transaction_id = Some(transaction_id);
+                connector.status = ConnectorState::Charging;
+                connector.id_tag = Some(id_tag.clone());
+                connector.current_power = 7.2; // Default 7.2kW
+                connector.energy_delivered = 0.0;
+                connector.last_status_time = chrono::Utc::now();
+                connector.remote_started = true;
+                // Initialize SoC for charging session (typical starting range)
+                connector.battery_soc = Some(25.0 + (connector_id as f64 * 5.0) % 50.0);
+                state.message_count += 1;
+
+                // Log remote start activity
+                state.recent_activities.push(ActivityLog {
+                    timestamp: chrono::Utc::now(),
+                    activity_type: ActivityType::RemoteStart,
+                    connector_id: Some(connector_id),
+                    message: format!("🆕 Remote start transaction {} initiated by Central System with ID tag '{}' - MeterValues enabled", transaction_id, id_tag),
+                });
+
+                // Keep only last 20 activities
+                if state.recent_activities.len() > 20 {
+                    state.recent_activities.remove(0);
+                }
+            }
+        }
+
+        // Send StatusNotification for charging state
+        tokio::spawn({
+            let simulator_clone = simulator.clone();
+            async move {
+                let _ = send_status_notification(simulator_clone.clone(), connector_id).await;
+                let _ =
+                    send_start_transaction(simulator_clone, connector_id, id_tag, transaction_id)
+                        .await;
+            }
+        });
+
+        info!(
+            "✅ Remote start transaction {} accepted on connector {}",
+            transaction_id, connector_id
+        );
+        "Accepted"
+    } else {
+        info!(
+            "❌ Remote start transaction rejected on connector {} (not available)",
+            connector_id
+        );
+        "Rejected"
+    };
+
     let response = serde_json::json!([
         3,
         message_id,
         {
-            "status": "Accepted"
+            "status": status
         }
     ]);
+
+    info!("🔄 Generated RemoteStartTransaction response: {}", response);
     Ok(Some(response.to_string()))
 }
 
 async fn handle_remote_stop_transaction_call(
     message_id: &str,
-    _payload: &Value,
+    payload: &Value,
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
 ) -> Result<Option<String>> {
+    let transaction_id = payload["transactionId"].as_u64().map(|id| id as u32);
+
+    info!(
+        "📞 Remote Stop Transaction request: transactionId={:?}",
+        transaction_id
+    );
+
+    // Find connector with matching transaction ID
+    let (connector_id, energy, can_stop) = {
+        let mut state = simulator.lock().await;
+        let mut found_connector = None;
+        let mut transaction_energy = 0.0;
+        let mut can_stop = false;
+
+        for (id, connector) in state.connector_states.iter_mut() {
+            if let Some(tx_id) = connector.transaction_id {
+                if transaction_id.is_none() || Some(tx_id) == transaction_id {
+                    // Found matching transaction
+                    found_connector = Some(*id);
+                    transaction_energy = connector.energy_delivered;
+                    can_stop = true;
+
+                    // Stop the transaction
+                    connector.transaction_id = None;
+                    connector.status = ConnectorState::Finishing;
+                    connector.current_power = 0.0;
+                    connector.id_tag = None;
+                    connector.battery_soc = None; // Reset SoC when remote stop
+                    connector.remote_started = false;
+                    connector.last_status_time = chrono::Utc::now();
+                    break;
+                }
+            }
+        }
+
+        if can_stop {
+            state.message_count += 1;
+
+            // Log remote stop activity
+            state.recent_activities.push(ActivityLog {
+                timestamp: chrono::Utc::now(),
+                activity_type: ActivityType::RemoteStop,
+                connector_id: found_connector,
+                message: format!("🛑 Remote stop transaction requested by Central System"),
+            });
+
+            // Keep only last 20 activities
+            if state.recent_activities.len() > 20 {
+                state.recent_activities.remove(0);
+            }
+        }
+
+        (found_connector, transaction_energy, can_stop)
+    };
+
+    let status = if can_stop && connector_id.is_some() {
+        let conn_id = connector_id.unwrap();
+        let actual_tx_id = transaction_id.unwrap_or_else(|| chrono::Utc::now().timestamp() as u32);
+
+        // Send StopTransaction and StatusNotification messages
+        tokio::spawn({
+            let simulator_clone = simulator.clone();
+            async move {
+                let _ = send_stop_transaction(simulator_clone.clone(), actual_tx_id, energy as i32)
+                    .await;
+
+                // Wait 2 seconds then update to finishing
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                {
+                    let mut state = simulator_clone.lock().await;
+                    if let Some(connector) = state.connector_states.get_mut(&conn_id) {
+                        connector.status = ConnectorState::Finishing;
+                        connector.last_status_time = chrono::Utc::now();
+                    }
+                }
+                let _ = send_status_notification(simulator_clone.clone(), conn_id).await;
+
+                // Wait another 2 seconds then transition to final state
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                {
+                    let mut state = simulator_clone.lock().await;
+                    if let Some(connector) = state.connector_states.get_mut(&conn_id) {
+                        connector.status = if connector.cable_plugged {
+                            ConnectorState::Preparing
+                        } else {
+                            ConnectorState::Available
+                        };
+                        connector.last_status_time = chrono::Utc::now();
+                    }
+                }
+                let _ = send_status_notification(simulator_clone, conn_id).await;
+            }
+        });
+
+        info!(
+            "✅ Remote stop transaction accepted on connector {}",
+            conn_id
+        );
+        "Accepted"
+    } else {
+        info!("❌ Remote stop transaction rejected (no matching transaction found)");
+        "Rejected"
+    };
+
     let response = serde_json::json!([
         3,
         message_id,
         {
-            "status": "Accepted"
+            "status": status
         }
     ]);
+
     Ok(Some(response.to_string()))
 }
 
@@ -776,8 +1210,42 @@ async fn show_status(
 
     // Display connector status
     println!("\n🔌 Connectors:");
-    for i in 1..=args.connectors {
-        println!("   Connector {}: {}", i, "Available".bright_green());
+    for (id, connector) in &state.connector_states {
+        let status_color = match connector.status {
+            ConnectorState::Available => "green",
+            ConnectorState::Charging => "yellow",
+            ConnectorState::Faulted => "red",
+            ConnectorState::Unavailable => "red",
+            _ => "cyan",
+        };
+        let cable_icon = if connector.cable_plugged {
+            "🔌"
+        } else {
+            "⚪"
+        };
+        let remote_indicator = if connector.remote_started {
+            " 📞"
+        } else {
+            ""
+        };
+        let tx_info = if let Some(tx_id) = connector.transaction_id {
+            let mut info = format!(" (Tx: {})", tx_id);
+            if let Some(soc) = connector.battery_soc {
+                info.push_str(&format!(" SoC: {:.1}%", soc));
+            }
+            info.bright_blue()
+        } else {
+            "".normal()
+        };
+
+        println!(
+            "   {} Connector {}: {}{}{}",
+            cable_icon,
+            id,
+            connector.status.to_string().color(status_color),
+            tx_info,
+            remote_indicator.bright_magenta()
+        );
     }
 
     // Display statistics
@@ -788,40 +1256,650 @@ async fn show_status(
     );
     println!("   Transactions: {}", "0".bright_cyan());
 
+    // Display recent activities
+    println!("\n📋 Recent Activities:");
+    let activities_displayed = std::cmp::min(5, state.recent_activities.len());
+    if activities_displayed == 0 {
+        println!("   No recent activities");
+    } else {
+        for activity in state
+            .recent_activities
+            .iter()
+            .rev()
+            .take(activities_displayed)
+        {
+            let time_str = activity.timestamp.format("%H:%M:%S").to_string();
+            println!("   {} {}", time_str.bright_black(), activity.message);
+        }
+        if state.recent_activities.len() > 5 {
+            println!(
+                "   ... and {} more activities",
+                state.recent_activities.len() - 5
+            );
+        }
+    }
+
     Ok(())
 }
 
 async fn connector_operations(
-    _args: &ConnectArgs,
-    _simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    args: &ConnectArgs,
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
 ) -> Result<()> {
-    println!("\n🔌 {}", "Connector Operations".bright_cyan().bold());
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━");
+    loop {
+        println!("\n🔌 {}", "Connector Operations".bright_cyan().bold());
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        // Display current connector status
+        {
+            let state = simulator.lock().await;
+            println!("\n📊 Current Connector Status:");
+            for (id, connector) in &state.connector_states {
+                let status_color = match connector.status {
+                    ConnectorState::Available => "green",
+                    ConnectorState::Charging => "yellow",
+                    ConnectorState::Faulted => "red",
+                    ConnectorState::Unavailable => "red",
+                    _ => "cyan",
+                };
+                let cable_icon = if connector.cable_plugged {
+                    "🔌"
+                } else {
+                    "⚪"
+                };
+                println!(
+                    "   {} Connector {}: {} {} {}",
+                    cable_icon,
+                    id,
+                    connector.status.to_string().color(status_color),
+                    if let Some(tx_id) = connector.transaction_id {
+                        format!("(Tx: {})", tx_id).bright_blue()
+                    } else {
+                        "".normal()
+                    },
+                    if connector.current_power > 0.0 {
+                        format!("{}kW", connector.current_power).bright_yellow()
+                    } else {
+                        "".normal()
+                    }
+                    .to_string()
+                        + if connector.remote_started {
+                            " 📞"
+                        } else {
+                            ""
+                        }
+                        + if connector.transaction_id.is_some() && connector.current_power > 0.0 {
+                            " 📊"
+                        } else {
+                            ""
+                        }
+                );
+            }
+        }
+
+        let theme = ColorfulTheme::default();
+        let operations = vec![
+            "🔌 Plug In Cable",
+            "🔌 Plug Out Cable",
+            "⚡ Start Transaction",
+            "🛑 Stop Transaction",
+            "🔧 Set Availability",
+            "📊 Show Detailed Status",
+            "📋 View Recent Activities",
+            "⬅️  Back to Main Menu",
+        ];
+
+        let selection = Select::with_theme(&theme)
+            .with_prompt("Choose connector operation")
+            .items(&operations)
+            .default(0)
+            .interact()?;
+
+        match selection {
+            0 => plug_cable_operation(simulator.clone(), true).await?,
+            1 => plug_cable_operation(simulator.clone(), false).await?,
+            2 => start_transaction_operation(simulator.clone()).await?,
+            3 => stop_transaction_operation(simulator.clone()).await?,
+            4 => set_availability_operation(simulator.clone()).await?,
+            5 => show_detailed_connector_status(simulator.clone()).await?,
+            6 => show_recent_activities(simulator.clone()).await?,
+            7 => return Ok(()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+async fn show_recent_activities(simulator: Arc<tokio::sync::Mutex<SimulatorState>>) -> Result<()> {
+    let state = simulator.lock().await;
+    println!("\n📋 {} ", "Recent Activities".bright_cyan().bold());
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if state.recent_activities.is_empty() {
+        println!("\n   No activities recorded yet");
+    } else {
+        for (i, activity) in state.recent_activities.iter().rev().enumerate() {
+            let time_str = activity.timestamp.format("%H:%M:%S UTC").to_string();
+            let connector_info = if let Some(conn_id) = activity.connector_id {
+                format!(" [C{}]", conn_id)
+            } else {
+                "".to_string()
+            };
+
+            println!(
+                "{}. {} {}{}",
+                i + 1,
+                time_str.bright_black(),
+                connector_info.bright_blue(),
+                activity.message
+            );
+        }
+    }
+
+    println!("\nPress Enter to continue...");
+    std::io::stdin().read_line(&mut String::new())?;
+
+    Ok(())
+}
+
+async fn plug_cable_operation(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    plug_in: bool,
+) -> Result<()> {
+    let connector_id = select_connector(simulator.clone()).await?;
+
+    {
+        let mut state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+            if plug_in {
+                if connector.cable_plugged {
+                    println!(
+                        "⚠️  Cable is already plugged in on connector {}",
+                        connector_id
+                    );
+                    return Ok(());
+                }
+                connector.cable_plugged = true;
+                connector.status = ConnectorState::Preparing;
+                println!("✅ Cable plugged into connector {}", connector_id);
+            } else {
+                if !connector.cable_plugged {
+                    println!("⚠️  No cable to unplug on connector {}", connector_id);
+                    return Ok(());
+                }
+                if connector.transaction_id.is_some() {
+                    println!("⚠️  Cannot unplug cable during active transaction. Stop transaction first.");
+                    return Ok(());
+                }
+                connector.cable_plugged = false;
+                connector.status = ConnectorState::Available;
+                println!("✅ Cable unplugged from connector {}", connector_id);
+            }
+            connector.last_status_time = chrono::Utc::now();
+            state.message_count += 1;
+        }
+    }
+
+    // Send StatusNotification
+    send_status_notification(simulator.clone(), connector_id).await?;
+
+    Ok(())
+}
+
+async fn start_transaction_operation(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+) -> Result<()> {
+    let connector_id = select_connector(simulator.clone()).await?;
+
+    // Check if connector is ready for transaction
+    {
+        let state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get(&connector_id) {
+            if !connector.cable_plugged {
+                println!("⚠️  Cable must be plugged in before starting transaction");
+                return Ok(());
+            }
+            if connector.transaction_id.is_some() {
+                println!(
+                    "⚠️  Transaction already active on connector {}",
+                    connector_id
+                );
+                return Ok(());
+            }
+            if connector.status == ConnectorState::Faulted
+                || connector.status == ConnectorState::Unavailable
+            {
+                println!(
+                    "⚠️  Connector {} is not available for transactions",
+                    connector_id
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // Get ID tag from user
+    println!("Enter ID tag for authorization (or press Enter for default 'DEMO_TAG'):");
+    let mut id_tag = String::new();
+    std::io::stdin().read_line(&mut id_tag)?;
+    let id_tag = id_tag.trim();
+    let id_tag = if id_tag.is_empty() {
+        "DEMO_TAG"
+    } else {
+        id_tag
+    };
+
+    // Generate transaction ID
+    let transaction_id = chrono::Utc::now().timestamp() as u32;
+
+    {
+        let mut state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+            connector.transaction_id = Some(transaction_id);
+            connector.status = ConnectorState::Charging;
+            connector.id_tag = Some(id_tag.to_string());
+            connector.current_power = 7.2; // Default 7.2kW
+            connector.energy_delivered = 0.0;
+            connector.remote_started = false; // Manual start
+            connector.last_status_time = chrono::Utc::now();
+            // Initialize SoC for charging session (typical starting range)
+            connector.battery_soc = Some(25.0 + (connector_id as f64 * 5.0) % 50.0);
+            state.message_count += 1;
+
+            // Log manual start activity
+            state.recent_activities.push(ActivityLog {
+                timestamp: chrono::Utc::now(),
+                activity_type: ActivityType::ManualStart,
+                connector_id: Some(connector_id),
+                message: format!(
+                    "⚡ Manual start transaction {} on connector {} with ID tag '{}' - MeterValues enabled",
+                    transaction_id, connector_id, id_tag
+                ),
+            });
+
+            // Keep only last 20 activities
+            if state.recent_activities.len() > 20 {
+                state.recent_activities.remove(0);
+            }
+        }
+    }
+
+    println!(
+        "⚡ Transaction {} started on connector {} with ID tag '{}'",
+        transaction_id, connector_id, id_tag
+    );
+
+    // Send StartTransaction message
+    send_start_transaction(
+        simulator.clone(),
+        connector_id,
+        id_tag.to_string(),
+        transaction_id,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn stop_transaction_operation(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+) -> Result<()> {
+    let connector_id = select_connector(simulator.clone()).await?;
+
+    let (transaction_id, energy) = {
+        let mut state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+            if let Some(tx_id) = connector.transaction_id {
+                let energy = connector.energy_delivered;
+                connector.transaction_id = None;
+                connector.status = if connector.cable_plugged {
+                    ConnectorState::Finishing
+                } else {
+                    ConnectorState::Available
+                };
+                connector.current_power = 0.0;
+                connector.id_tag = None;
+                connector.remote_started = false;
+                connector.battery_soc = None; // Reset SoC when transaction ends
+                connector.last_status_time = chrono::Utc::now();
+                state.message_count += 1;
+
+                // Log manual stop activity
+                state.recent_activities.push(ActivityLog {
+                    timestamp: chrono::Utc::now(),
+                    activity_type: ActivityType::ManualStop,
+                    connector_id: Some(connector_id),
+                    message: format!(
+                        "🛑 Manual stop transaction {} on connector {} - Energy: {:.2} kWh",
+                        tx_id, connector_id, energy
+                    ),
+                });
+
+                // Keep only last 20 activities
+                if state.recent_activities.len() > 20 {
+                    state.recent_activities.remove(0);
+                }
+
+                (tx_id, energy)
+            } else {
+                println!("⚠️  No active transaction on connector {}", connector_id);
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    };
+
+    println!(
+        "🛑 Transaction {} stopped on connector {}. Energy delivered: {:.2} kWh",
+        transaction_id, connector_id, energy
+    );
+
+    // Send StopTransaction message
+    send_stop_transaction(simulator.clone(), transaction_id, energy as i32).await?;
+
+    // Handle status transitions in a background task to avoid blocking UI
+    tokio::spawn({
+        let simulator_clone = simulator.clone();
+        async move {
+            // Wait 1 second then update to finishing
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            {
+                let mut state = simulator_clone.lock().await;
+                if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+                    connector.status = ConnectorState::Finishing;
+                    connector.last_status_time = chrono::Utc::now();
+                }
+            }
+            let _ = send_status_notification(simulator_clone.clone(), connector_id).await;
+
+            // Wait another 2 seconds then transition to final state
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            {
+                let mut state = simulator_clone.lock().await;
+                if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+                    connector.status = if connector.cable_plugged {
+                        ConnectorState::Preparing
+                    } else {
+                        ConnectorState::Available
+                    };
+                    connector.last_status_time = chrono::Utc::now();
+                }
+            }
+            let _ = send_status_notification(simulator_clone, connector_id).await;
+        }
+    });
+
+    Ok(())
+}
+
+async fn set_availability_operation(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+) -> Result<()> {
+    let connector_id = select_connector(simulator.clone()).await?;
 
     let theme = ColorfulTheme::default();
-    let operations = vec![
-        "Plug In Cable",
-        "Plug Out Cable",
-        "Start Transaction",
-        "Stop Transaction",
-        "Set Availability",
-        "Back to Main Menu",
-    ];
+    let availability_options = vec!["🟢 Make Available", "🔴 Make Unavailable", "🚨 Set Faulted"];
 
     let selection = Select::with_theme(&theme)
-        .with_prompt("Choose connector operation")
-        .items(&operations)
+        .with_prompt("Set availability status")
+        .items(&availability_options)
         .default(0)
         .interact()?;
 
-    match selection {
-        0 => println!("✅ Cable plugged in"),
-        1 => println!("✅ Cable plugged out"),
-        2 => println!("✅ Transaction started"),
-        3 => println!("✅ Transaction stopped"),
-        4 => println!("✅ Availability set"),
-        5 => return Ok(()),
+    let new_status = match selection {
+        0 => ConnectorState::Available,
+        1 => ConnectorState::Unavailable,
+        2 => ConnectorState::Faulted,
         _ => unreachable!(),
+    };
+
+    {
+        let mut state = simulator.lock().await;
+        if let Some(connector) = state.connector_states.get_mut(&connector_id) {
+            if connector.transaction_id.is_some() && new_status != ConnectorState::Available {
+                println!("⚠️  Cannot change availability during active transaction");
+                return Ok(());
+            }
+            connector.status = new_status.clone();
+            connector.last_status_time = chrono::Utc::now();
+            state.message_count += 1;
+        }
+    }
+
+    println!(
+        "✅ Connector {} availability set to {}",
+        connector_id, new_status
+    );
+    send_status_notification(simulator.clone(), connector_id).await?;
+
+    Ok(())
+}
+
+async fn show_detailed_connector_status(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+) -> Result<()> {
+    let state = simulator.lock().await;
+    println!("\n📊 {} ", "Detailed Connector Status".bright_cyan().bold());
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    for (id, connector) in &state.connector_states {
+        println!("\n🔌 Connector {}:", id);
+        println!("   Status: {}", connector.status);
+        println!(
+            "   Cable: {}",
+            if connector.cable_plugged {
+                "Plugged"
+            } else {
+                "Not plugged"
+            }
+        );
+        println!("   Error Code: {}", connector.error_code);
+        if let Some(tx_id) = connector.transaction_id {
+            println!("   Transaction ID: {}", tx_id);
+            println!("   Current Power: {:.1} kW", connector.current_power);
+            println!("   Energy Delivered: {:.2} kWh", connector.energy_delivered);
+            if let Some(soc) = connector.battery_soc {
+                println!("   Battery SoC: {:.1}%", soc);
+            }
+        }
+        if let Some(id_tag) = &connector.id_tag {
+            println!("   ID Tag: {}", id_tag);
+        }
+        if connector.remote_started {
+            println!("   Remote Started: 📞 {}", "Yes".bright_magenta());
+        }
+        if connector.transaction_id.is_some() && connector.current_power > 0.0 {
+            println!(
+                "   MeterValues: 📊 {}",
+                "Active (10s intervals)".bright_cyan()
+            );
+        }
+        println!(
+            "   Last Update: {}",
+            connector.last_status_time.format("%H:%M:%S")
+        );
+    }
+
+    println!("\nPress Enter to continue...");
+    std::io::stdin().read_line(&mut String::new())?;
+
+    Ok(())
+}
+
+async fn select_connector(simulator: Arc<tokio::sync::Mutex<SimulatorState>>) -> Result<u32> {
+    let state = simulator.lock().await;
+    let theme = ColorfulTheme::default();
+
+    let connector_options: Vec<String> = state
+        .connector_states
+        .iter()
+        .map(|(id, connector)| {
+            format!(
+                "Connector {} ({}{})",
+                id,
+                connector.status,
+                if connector.cable_plugged { " 🔌" } else { "" }
+            )
+        })
+        .collect();
+
+    let selection = Select::with_theme(&theme)
+        .with_prompt("Select connector")
+        .items(&connector_options)
+        .default(0)
+        .interact()?;
+
+    let connector_ids: Vec<u32> = state.connector_states.keys().cloned().collect();
+    Ok(connector_ids[selection])
+}
+
+async fn send_status_notification(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    connector_id: u32,
+) -> Result<()> {
+    let state = simulator.lock().await;
+    if let Some(connector) = state.connector_states.get(&connector_id) {
+        let status_notification = serde_json::json!([
+            2,
+            format!("{}", chrono::Utc::now().timestamp()),
+            "StatusNotification",
+            {
+                "connectorId": connector_id,
+                "errorCode": connector.error_code,
+                "status": connector.status.to_string(),
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            }
+        ]);
+
+        if let Some(tx) = &state.websocket_tx {
+            let _ = tx
+                .send(Message::Text(status_notification.to_string()))
+                .await;
+            println!("📤 Sent StatusNotification for connector {}", connector_id);
+        }
+    }
+    Ok(())
+}
+
+async fn send_start_transaction(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    connector_id: u32,
+    id_tag: String,
+    transaction_id: u32,
+) -> Result<()> {
+    let state = simulator.lock().await;
+    let start_transaction = serde_json::json!([
+        2,
+        format!("{}", chrono::Utc::now().timestamp()),
+        "StartTransaction",
+        {
+            "connectorId": connector_id,
+            "idTag": id_tag,
+            "meterStart": 0,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }
+    ]);
+
+    if let Some(tx) = &state.websocket_tx {
+        let _ = tx.send(Message::Text(start_transaction.to_string())).await;
+        println!("📤 Sent StartTransaction for connector {}", connector_id);
+    }
+
+    // Send status notification for charging state
+    drop(state);
+    send_status_notification(simulator, connector_id).await?;
+
+    Ok(())
+}
+
+async fn send_stop_transaction(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    transaction_id: u32,
+    meter_stop: i32,
+) -> Result<()> {
+    let state = simulator.lock().await;
+    let stop_transaction = serde_json::json!([
+        2,
+        format!("{}", chrono::Utc::now().timestamp()),
+        "StopTransaction",
+        {
+            "transactionId": transaction_id,
+            "meterStop": meter_stop,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }
+    ]);
+
+    if let Some(tx) = &state.websocket_tx {
+        let _ = tx.send(Message::Text(stop_transaction.to_string())).await;
+        println!("📤 Sent StopTransaction for transaction {}", transaction_id);
+    }
+
+    Ok(())
+}
+
+async fn send_meter_values(
+    simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
+    connector_id: u32,
+    transaction_id: u32,
+    energy_wh: i32,
+    power_w: f64,
+    soc_percent: Option<f64>,
+) -> Result<()> {
+    let state = simulator.lock().await;
+
+    let mut sampled_values = vec![
+        serde_json::json!({
+            "value": format!("{}", energy_wh),
+            "context": "Sample.Periodic",
+            "format": "Raw",
+            "measurand": "Energy.Active.Import.Register",
+            "unit": "Wh"
+        }),
+        serde_json::json!({
+            "value": format!("{:.1}", power_w),
+            "context": "Sample.Periodic",
+            "format": "Raw",
+            "measurand": "Power.Active.Import",
+            "unit": "W"
+        }),
+    ];
+
+    // Add SoC if available
+    if let Some(soc) = soc_percent {
+        sampled_values.push(serde_json::json!({
+            "value": format!("{:.1}", soc),
+            "context": "Sample.Periodic",
+            "format": "Raw",
+            "measurand": "SoC",
+            "unit": "Percent"
+        }));
+    }
+
+    let meter_values = serde_json::json!([
+        2,
+        format!("{}", chrono::Utc::now().timestamp()),
+        "MeterValues",
+        {
+            "connectorId": connector_id,
+            "transactionId": transaction_id,
+            "meterValue": [{
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "sampledValue": sampled_values
+            }]
+        }
+    ]);
+
+    if let Some(tx) = &state.websocket_tx {
+        let _ = tx.send(Message::Text(meter_values.to_string())).await;
+        let soc_info = if let Some(soc) = soc_percent {
+            format!(" (SoC: {:.1}%)", soc)
+        } else {
+            String::new()
+        };
+        debug!(
+            "📊 Sent MeterValues for connector {} transaction {}{}",
+            connector_id, transaction_id, soc_info
+        );
     }
 
     Ok(())
